@@ -45,21 +45,17 @@
 
 #define LOW_WATERMARK		2
 #define HIGH_WATERMARK		4
-#define DEFAULT_POLLING_MIN_SLEEP (950)
+#define DEFAULT_POLLING_MIN_SLEEP (1000)
 #define MAX_POLLING_SLEEP (6050)
 #define MIN_POLLING_SLEEP (950)
-
-#ifdef BAM_DMUX_FD
-static unsigned int wakelock_timeout;
-#endif
 
 static int msm_bam_dmux_debug_enable;
 module_param_named(debug_enable, msm_bam_dmux_debug_enable,
 		   int, S_IRUGO | S_IWUSR | S_IWGRP);
-static int POLLING_MIN_SLEEP = 2950;
+static int POLLING_MIN_SLEEP = 4950;
 module_param_named(min_sleep, POLLING_MIN_SLEEP,
 		   int, S_IRUGO | S_IWUSR | S_IWGRP);
-static int POLLING_MAX_SLEEP = 3050;
+static int POLLING_MAX_SLEEP = 5000;
 module_param_named(max_sleep, POLLING_MAX_SLEEP,
 		   int, S_IRUGO | S_IWUSR | S_IWGRP);
 static int POLLING_INACTIVITY = 1;
@@ -182,7 +178,7 @@ struct bam_ch_info {
 #define A2_DEFAULT_DESCRIPTORS	32
 #define A2_PHYS_BASE		0x124C2000
 #define A2_PHYS_SIZE		0x2000
-#define NUM_BUFFERS		32
+#define DEFAULT_NUM_BUFFERS	32
 
 #ifndef A2_BAM_IRQ
 #define A2_BAM_IRQ -1
@@ -201,6 +197,8 @@ static struct sps_mem_buffer tx_desc_mem_buf;
 static struct sps_mem_buffer rx_desc_mem_buf;
 static struct sps_register_event tx_register_event;
 static struct sps_register_event rx_register_event;
+static bool satellite_mode;
+static uint32_t num_buffers;
 static unsigned long long last_rx_pkt_timestamp;
 
 static struct bam_ch_info bam_ch[BAM_DMUX_NUM_CHANNELS];
@@ -273,7 +271,6 @@ static DEFINE_MUTEX(smsm_cb_lock);
 static DEFINE_MUTEX(delayed_ul_vote_lock);
 static int need_delayed_ul_vote;
 static int power_management_only_mode;
-static int in_ssr;
 static int ssr_skipped_disconnect;
 static struct completion shutdown_completion;
 
@@ -401,7 +398,7 @@ static void __queue_rx(gfp_t alloc_flags)
 	rx_len_cached = bam_rx_pool_len;
 	mutex_unlock(&bam_rx_pool_mutexlock);
 
-	while (bam_connection_is_active && rx_len_cached < NUM_BUFFERS) {
+	while (bam_connection_is_active && rx_len_cached < num_buffers) {
 		if (in_global_reset)
 			goto fail;
 
@@ -1256,14 +1253,14 @@ static void rx_timer_work_func(struct work_struct *work)
 				break;
 			}
 
-			buffs_used = NUM_BUFFERS - buffs_unused;
+			buffs_used = num_buffers - buffs_unused;
 
 			if (buffs_unused == 0) {
 				rx_timer_interval = MIN_POLLING_SLEEP;
 			} else {
 				if (buffs_used > 0) {
 					rx_timer_interval =
-						(2 * NUM_BUFFERS *
+						(2 * num_buffers *
 							rx_timer_interval)/
 						(3 * buffs_used);
 				} else {
@@ -1675,8 +1672,10 @@ static int ssrestart_check(void)
 								__func__);
 	in_global_reset = 1;
 	ret = subsystem_restart("modem");
-	if (ret == -ENODEV)
-		panic("modem subsystem restart failed\n");
+	if (ret == -ENODEV) {
+		DMUX_LOG_KERR("%s: modem subsystem restart failed\n", __func__);
+		dump_stack();
+	}
 	return 1;
 }
 
@@ -1791,8 +1790,11 @@ static void reconnect_to_bam(void)
 {
 	int i;
 
-	in_global_reset = 0;
-	in_ssr = 0;
+	if (in_global_reset) {
+		BAM_DMUX_LOG("%s: skipping due to SSR\n", __func__);
+		return;
+	}
+
 	vote_dfab();
 	if (!power_management_only_mode) {
 		if (ssr_skipped_disconnect) {
@@ -1853,6 +1855,7 @@ static void disconnect_to_bam(void)
 			DMUX_LOG_KERR("%s: shutdown completion timed out\n",
 					__func__);
 			log_rx_timestamp();
+			ssrestart_check();
 		}
 	}
 
@@ -1870,15 +1873,17 @@ static void disconnect_to_bam(void)
 	/* tear down BAM connection */
 	INIT_COMPLETION(bam_connection_completion);
 
-	/* in_ssr documentation/assumptions found in restart_notifier_cb */
+	/* documentation/assumptions found in restart_notifier_cb */
 	if (!power_management_only_mode) {
-		if (likely(!in_ssr)) {
+		if (likely(!in_global_reset)) {
 			BAM_DMUX_LOG("%s: disconnect tx\n", __func__);
 			bam_ops->sps_disconnect_ptr(bam_tx_pipe);
 			BAM_DMUX_LOG("%s: disconnect rx\n", __func__);
 			bam_ops->sps_disconnect_ptr(bam_rx_pipe);
 			__memzero(rx_desc_mem_buf.base, rx_desc_mem_buf.size);
 			__memzero(tx_desc_mem_buf.base, tx_desc_mem_buf.size);
+			BAM_DMUX_LOG("%s: device reset\n", __func__);
+			sps_device_reset(a2_device_handle);
 		} else {
 			ssr_skipped_disconnect = 1;
 		}
@@ -1977,12 +1982,8 @@ static void release_wakelock(void)
 	BAM_DMUX_LOG("%s: ref count = %d\n", __func__,
 						wakelock_reference_count);
 	--wakelock_reference_count;
-	if (wakelock_reference_count == 0) {
+	if (wakelock_reference_count == 0)
 		wake_unlock(&bam_wakelock);
-#ifdef BAM_DMUX_FD
-		wake_lock_timeout(&bam_wakelock, wakelock_timeout * HZ);
-#endif
-		}
 	spin_unlock_irqrestore(&wakelock_reference_lock, flags);
 }
 
@@ -2012,12 +2013,13 @@ static int restart_notifier_cb(struct notifier_block *this,
 	if (code == SUBSYS_BEFORE_SHUTDOWN) {
 		BAM_DMUX_LOG("%s: begin\n", __func__);
 		in_global_reset = 1;
-		in_ssr = 1;
-		/* wait till all bam_dmux writes completes */
+		/* sync to ensure the driver sees SSR */
 		synchronize_srcu(&bam_dmux_srcu);
 		BAM_DMUX_LOG("%s: ssr signaling complete\n", __func__);
 		flush_workqueue(bam_mux_rx_workqueue);
 	}
+	if (code == SUBSYS_BEFORE_POWERUP)
+		in_global_reset = 0;
 	if (code != SUBSYS_AFTER_SHUTDOWN)
 		return NOTIFY_DONE;
 
@@ -2089,7 +2091,6 @@ static int bam_init(void)
 	int skip_iounmap = 0;
 
 	in_global_reset = 0;
-	in_ssr = 0;
 	vote_dfab();
 	/* init BAM */
 	a2_virt_addr = ioremap_nocache((unsigned long)(a2_phys_base),
@@ -2106,7 +2107,9 @@ static int bam_init(void)
 	a2_props.options = SPS_BAM_OPT_IRQ_WAKEUP;
 	a2_props.num_pipes = A2_NUM_PIPES;
 	a2_props.summing_threshold = A2_SUMMING_THRESHOLD;
-	if (cpu_is_msm9615())
+	a2_props.constrained_logging = true;
+	a2_props.logging_number = 1;
+	if (cpu_is_msm9615() || satellite_mode)
 		a2_props.manage = SPS_BAM_MGR_DEVICE_REMOTE;
 	/* need to free on tear down */
 	ret = bam_ops->sps_register_bam_device_ptr(&a2_props, &h);
@@ -2278,7 +2281,7 @@ static int bam_init_fallback(void)
 	a2_props.options = SPS_BAM_OPT_IRQ_WAKEUP;
 	a2_props.num_pipes = A2_NUM_PIPES;
 	a2_props.summing_threshold = A2_SUMMING_THRESHOLD;
-	if (cpu_is_msm9615())
+	if (cpu_is_msm9615() || satellite_mode)
 		a2_props.manage = SPS_BAM_MGR_DEVICE_REMOTE;
 	ret = bam_ops->sps_register_bam_device_ptr(&a2_props, &h);
 	if (ret < 0) {
@@ -2342,7 +2345,9 @@ static void toggle_apps_ack(void)
 static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 {
 	static int last_processed_state;
+	int rcu_id;
 
+	rcu_id = srcu_read_lock(&bam_dmux_srcu);
 	mutex_lock(&smsm_cb_lock);
 	bam_dmux_power_state = new_state & SMSM_A2_POWER_CONTROL ? 1 : 0;
 	DBG_INC_A2_POWER_CONTROL_IN_CNT();
@@ -2351,6 +2356,7 @@ static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 	if (last_processed_state == (new_state & SMSM_A2_POWER_CONTROL)) {
 		BAM_DMUX_LOG("%s: already processed this state\n", __func__);
 		mutex_unlock(&smsm_cb_lock);
+		srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 		return;
 	}
 
@@ -2377,16 +2383,20 @@ static void bam_dmux_smsm_cb(void *priv, uint32_t old_state, uint32_t new_state)
 		pr_err("%s: unsupported state change\n", __func__);
 	}
 	mutex_unlock(&smsm_cb_lock);
-
+	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 }
 
 static void bam_dmux_smsm_ack_cb(void *priv, uint32_t old_state,
 						uint32_t new_state)
 {
+	int rcu_id;
+
+	rcu_id = srcu_read_lock(&bam_dmux_srcu);
 	DBG_INC_ACK_IN_CNT();
 	BAM_DMUX_LOG("%s: 0x%08x -> 0x%08x\n", __func__, old_state,
 			new_state);
 	complete_all(&ul_wakeup_ack_completion);
+	srcu_read_unlock(&bam_dmux_srcu, rcu_id);
 }
 
 /**
@@ -2415,6 +2425,9 @@ void msm_bam_dmux_deinit(void)
 {
 	restart_notifier_cb(NULL, SUBSYS_BEFORE_SHUTDOWN, NULL);
 	restart_notifier_cb(NULL, SUBSYS_AFTER_SHUTDOWN, NULL);
+	restart_notifier_cb(NULL, SUBSYS_BEFORE_POWERUP, NULL);
+	restart_notifier_cb(NULL, SUBSYS_AFTER_POWERUP, NULL);
+	in_global_reset = 0;
 }
 EXPORT_SYMBOL(msm_bam_dmux_deinit);
 
@@ -2456,14 +2469,30 @@ static int bam_dmux_probe(struct platform_device *pdev)
 			pr_err("%s: irq field missing\n", __func__);
 			return -ENODEV;
 		}
-		DBG("%s: base:%p size:%x irq:%d\n", __func__,
+		satellite_mode = of_property_read_bool(pdev->dev.of_node,
+						"qcom,satellite-mode");
+
+		rc = of_property_read_u32(pdev->dev.of_node,
+						"qcom,rx-ring-size",
+						&num_buffers);
+		if (rc) {
+			DBG("%s: falling back to num_buffs default, rc:%d\n",
+							__func__, rc);
+			num_buffers = DEFAULT_NUM_BUFFERS;
+		}
+
+		DBG("%s: base:%p size:%x irq:%d satellite:%d num_buffs:%d\n",
+							__func__,
 							a2_phys_base,
 							a2_phys_size,
-							a2_bam_irq);
+							a2_bam_irq,
+							satellite_mode,
+							num_buffers);
 	} else { /* fallback to default init data */
 		a2_phys_base = (void *)(A2_PHYS_BASE);
 		a2_phys_size = A2_PHYS_SIZE;
 		a2_bam_irq = A2_BAM_IRQ;
+		num_buffers = DEFAULT_NUM_BUFFERS;
 	}
 
 	xo_clk = clk_get(&pdev->dev, "xo");
@@ -2580,38 +2609,6 @@ static struct platform_driver bam_dmux_driver = {
 	},
 };
 
-#ifdef BAM_DMUX_FD
-struct device *bamDmux_pkt_dev;
-
-static ssize_t show_waketime(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	if (!bamDmux_pkt_dev)
-		return 0;
-
-	return snprintf(buf, (int)sizeof(buf), "%u\n", wakelock_timeout);
-}
-
-static ssize_t store_waketime(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	int r;
-	unsigned long msec;
-	if (!bamDmux_pkt_dev)
-		return count;
-
-	r = kstrtoul(buf, 10, &msec);
-
-	if (r)
-		return count;
-
-	wakelock_timeout = (msec/1000);
-	return count;
-}
-
-static DEVICE_ATTR(waketime, 0664, show_waketime, store_waketime);
-#endif
-
 static int __init bam_dmux_init(void)
 {
 #ifdef CONFIG_DEBUG_FS
@@ -2623,18 +2620,6 @@ static int __init bam_dmux_init(void)
 		debug_create("ul_pkt_cnt", 0444, dent, debug_ul_pkt_cnt);
 		debug_create("stats", 0444, dent, debug_stats);
 	}
-#endif
-
-#ifdef BAM_DMUX_FD
-	wakelock_timeout = 0;
-	bamDmux_pkt_dev = device_create(sec_class, NULL, 0, NULL, "bamdmux");
-	if (IS_ERR(bamDmux_pkt_dev))
-		pr_err("%s: Failed to create device(bamDmux_pkt_dev)!\n",
-			__func__);
-
-	if (device_create_file(bamDmux_pkt_dev, &dev_attr_waketime) < 0)
-		pr_err("%s: Failed to create device file(%s)!\n",
-			__func__, dev_attr_waketime.attr.name);
 #endif
 
 	bam_ipc_log_txt = ipc_log_context_create(BAM_IPC_LOG_PAGES, "bam_dmux");

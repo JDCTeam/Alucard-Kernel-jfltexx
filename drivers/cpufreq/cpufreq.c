@@ -496,8 +496,6 @@ static ssize_t store_##file_name					\
 		pr_err("cpufreq: Frequency verification failed\n");	\
 									\
 	policy->user_policy.object = new_policy.object;			\
-									\
-	policy->user_policy.object = new_policy.object;			\
 	ret = __cpufreq_set_policy(policy, &new_policy);		\
 									\
 	return ret ? ret : count;					\
@@ -1845,12 +1843,17 @@ EXPORT_SYMBOL(cpufreq_quick_get_util);
  */
 unsigned int cpufreq_quick_get(unsigned int cpu)
 {
-	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
+	struct cpufreq_policy *policy;
 	unsigned int ret_freq = 0;
 
-	if (policy) {
-		ret_freq = policy->cur;
-		cpufreq_cpu_put(policy);
+	if (cpufreq_driver && cpufreq_driver->setpolicy && cpufreq_driver->get)
+		ret_freq = cpufreq_driver->get(cpu);
+	else {
+		policy = cpufreq_cpu_get(cpu);
+		if (policy) {
+			ret_freq = policy->cur;
+			cpufreq_cpu_put(policy);
+		}
 	}
 
 	return ret_freq;
@@ -2336,9 +2339,6 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 				struct cpufreq_policy *policy)
 {
 	int ret = 0;
-#ifdef CONFIG_UNI_CPU_POLICY_LIMIT
-	struct cpufreq_policy *cpu0_policy = NULL;
-#endif
 	unsigned int qmin, qmax;
 	unsigned int pmin = policy->min;
 	unsigned int pmax = policy->max;
@@ -2387,19 +2387,8 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 	blocking_notifier_call_chain(&cpufreq_policy_notifier_list,
 			CPUFREQ_NOTIFY, policy);
 
-#ifdef CONFIG_UNI_CPU_POLICY_LIMIT
-	if (policy->cpu) {
-		cpu0_policy = __cpufreq_cpu_get(0, 0);
-		data->min = cpu0_policy->min;
-		data->max = cpu0_policy->max;
-	} else {
-		data->min = policy->min;
-		data->max = policy->max;
-	}
-#else
 	data->min = policy->min;
 	data->max = policy->max;
-#endif
 
 	pr_debug("new min and max freqs are %u - %u kHz\n",
 					data->min, data->max);
@@ -2420,15 +2409,7 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 				__cpufreq_governor(data, CPUFREQ_GOV_STOP);
 
 			/* start new governor */
-#ifdef CONFIG_UNI_CPU_POLICY_LIMIT
-			if (policy->cpu && cpu0_policy) {
-				data->governor = cpu0_policy->governor;
-			} else {
-				data->governor = policy->governor;
-			}
-#else
 			data->governor = policy->governor;
-#endif
 
 			if (__cpufreq_governor(data, CPUFREQ_GOV_START)) {
 				/* new governor failed, so re-start old one */
@@ -2449,11 +2430,6 @@ static int __cpufreq_set_policy(struct cpufreq_policy *data,
 	}
 
 error_out:
-#ifdef CONFIG_UNI_CPU_POLICY_LIMIT
-	if (cpu0_policy) {
-		__cpufreq_cpu_put(cpu0_policy, false);
-	}
-#endif
 	/* restore the limits that the policy requested */
 	policy->min = pmin;
 	policy->max = pmax;
@@ -2498,7 +2474,7 @@ int cpufreq_update_policy(unsigned int cpu)
 			pr_debug("Driver did not initialize current freq");
 			data->cur = policy.cur;
 		} else {
-			if (data->cur != policy.cur)
+			if (data->cur != policy.cur && cpufreq_driver->target)
 				cpufreq_out_of_sync(cpu, data->cur,
 								policy.cur);
 		}

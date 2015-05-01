@@ -20,17 +20,22 @@
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/cpufreq.h>
-#include <linux/fb.h>
 #include <linux/mutex.h>
 #include <linux/input.h>
 #include <linux/math64.h>
 #include <linux/kernel_stat.h>
 #include <linux/tick.h>
 
+#ifdef CONFIG_POWERSUSPEND
+#include <linux/powersuspend.h>
+#else
+#include <linux/fb.h>
+#endif
+
 #define MSM_HOTPLUG			"msm_hotplug"
 #define HOTPLUG_ENABLED			0
 #define DEFAULT_UPDATE_RATE		HZ / 10
-#define START_DELAY			HZ * 5
+#define START_DELAY			HZ * 10
 #define MIN_INPUT_INTERVAL		150 * 1000L
 #define DEFAULT_HISTORY_SIZE		10
 #define DEFAULT_DOWN_LOCK_DUR		1000
@@ -86,7 +91,9 @@ static struct cpu_hotplug {
 	struct delayed_work suspend_work;
 	struct work_struct resume_work;
 	struct mutex msm_hotplug_mutex;
+#ifndef CONFIG_POWERSUSPEND
 	struct notifier_block notif;
+#endif
 } hotplug = {
 	.msm_enabled = HOTPLUG_ENABLED,
 	.min_cpus_online = DEFAULT_MIN_CPUS_ONLINE,
@@ -544,7 +551,11 @@ static void __ref msm_hotplug_resume(struct work_struct *work)
 		reschedule_hotplug_work();
 }
 
+#ifdef CONFIG_POWERSUSPEND
+static void __msm_hotplug_suspend(struct power_suspend *handler)
+#else
 static void __msm_hotplug_suspend(void)
+#endif
 {
 	if (!hotplug.msm_enabled || hotplug.suspended)
 		return;
@@ -557,7 +568,11 @@ static void __msm_hotplug_suspend(void)
 			msecs_to_jiffies(hotplug.suspend_defer_time * 1000));
 }
 
+#ifdef CONFIG_POWERSUSPEND
+static void __ref __msm_hotplug_resume(struct power_suspend *handler)
+#else
 static void __ref __msm_hotplug_resume(void)
+#endif
 {
 	int cpu;
 
@@ -581,6 +596,12 @@ static void __ref __msm_hotplug_resume(void)
 	queue_work_on(0, susp_wq, &hotplug.resume_work);
 }
 
+#ifdef CONFIG_POWERSUSPEND
+static struct power_suspend msm_hotplug_power_suspend_driver = {
+	.suspend = __msm_hotplug_suspend,
+	.resume = __msm_hotplug_resume,
+};
+#else
 static int prev_fb = FB_BLANK_UNBLANK;
 
 static int fb_notifier_callback(struct notifier_block *self,
@@ -611,6 +632,7 @@ static int fb_notifier_callback(struct notifier_block *self,
 
 	return NOTIFY_OK;
 }
+#endif
 
 static void hotplug_input_event(struct input_handle *handle, unsigned int type,
 				unsigned int code, int value)
@@ -725,12 +747,16 @@ static int __ref msm_hotplug_start(void)
 		goto err_out;
 	}
 
+#ifdef CONFIG_POWERSUSPEND
+	register_power_suspend(&msm_hotplug_power_suspend_driver);
+#else
 	hotplug.notif.notifier_call = fb_notifier_callback;
 	if (fb_register_client(&hotplug.notif)) {
 		pr_err("%s: Failed to register FB notifier callback\n",
 			MSM_HOTPLUG);
 		goto err_dev;
 	}
+#endif
 
 	ret = input_register_handler(&hotplug_input_handler);
 	if (ret) {
@@ -759,12 +785,11 @@ static int __ref msm_hotplug_start(void)
 	INIT_DELAYED_WORK(&hotplug.suspend_work, msm_hotplug_suspend);
 	INIT_WORK(&hotplug.resume_work, msm_hotplug_resume);
 
-	/* Fire up all CPUs */
-	for_each_cpu_not(cpu, cpu_online_mask) {
+	/* Put all sibling cores to sleep */
+	for_each_online_cpu(cpu) {
 		if (cpu == 0)
 			continue;
-		cpu_up(cpu);
-		apply_down_lock(cpu);
+		cpu_down(cpu);
 	}
 
 	mod_delayed_work_on(0, hotplug_wq, &hotplug_work,
@@ -799,19 +824,16 @@ static void msm_hotplug_stop(void)
 	mutex_destroy(&stats.stats_mutex);
 	kfree(stats.load_hist);
 
+#ifdef CONFIG_POWERSUSPEND
+	unregister_power_suspend(&msm_hotplug_power_suspend_driver);
+#else
 	fb_unregister_client(&hotplug.notif);
 	hotplug.notif.notifier_call = NULL;
+#endif
 	input_unregister_handler(&hotplug_input_handler);
 
 	destroy_workqueue(susp_wq);
 	destroy_workqueue(hotplug_wq);
-
-	/* Put all sibling cores to sleep */
-	for_each_online_cpu(cpu) {
-		if (cpu == 0)
-			continue;
-		cpu_down(cpu);
-	}
 }
 
 static unsigned int *get_tokenized_data(const char *buf, int *num_tokens)

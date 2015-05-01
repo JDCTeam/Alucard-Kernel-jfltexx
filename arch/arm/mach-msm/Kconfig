@@ -1802,13 +1802,6 @@ config ALUCARD_HOTPLUG
 	help
 	  Generic Alucard-hotplug cpu hotplug driver for ARM SOCs
 
-config ALUCARD_HOTPLUG_USE_CPU_UTIL
-	bool "Enable alucard-hotplug cpu statistics utilization"
-	depends on (ALUCARD_HOTPLUG)
-	default n
-	help
-	  Alucard-hotplug cpu statistics utilization
-
 config CPU_VOLTAGE_TABLE
 	bool "Enable CPU Voltage Table via sysfs for adjustements"
 	default n
@@ -3057,7 +3050,8 @@ config FORCE_FAST_CHARGE
 
 config CPUFREQ_LIMIT_MANAGER
 	bool "CPUFREQ limitter for suspend, gps, oncall using"
-	default n
+	depends on SEC_DVFS
+	default y
 	help
 	  A simple sysfs interface to limit cpufreq,
 	  when using gps, or call or suspend.
