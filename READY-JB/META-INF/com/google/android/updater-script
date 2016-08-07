@@ -49,6 +49,7 @@ delete_recursive("/system/lib/modules/usb_wwan.ko");
 ui_print("Deleting old binaries");
 ui_print("");
 delete_recursive("/system/xbin/sqlite3");
+delete_recursive("/system/xbin/zip");
 delete_recursive("/system/xbin/wget");
 
 ui_print("Copying modules and apps");
@@ -57,6 +58,7 @@ package_extract_dir("system", "/system");
 package_extract_dir("data", "/data");
 set_perm_recursive(0, 0, 0755, 0644, "/system/lib/modules");
 set_perm(0, 0, 0755, "/system/xbin/sqlite3");
+set_perm(0, 0, 0755, "/system/xbin/zip");
 set_perm(0, 0, 0755, "/system/wget/wget");
 
 ui_print("Deleting old tmp files");
