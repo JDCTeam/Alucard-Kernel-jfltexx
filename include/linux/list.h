@@ -447,6 +447,17 @@ static inline void list_splice_tail_init(struct list_head *list,
 	     pos != (head); \
 	     pos = n, n = pos->prev)
 
+#define hlist_for_each_entry_safe5(tpos, pos, n, head, member) 		 \
+	for (pos = (head)->first;					 \
+	     pos && ({ n = pos->next; 1; }) && 				 \
+		({ tpos = hlist_entry(pos, typeof(*tpos), member); 1;}); \
+	     pos = n)
+
+#define hlist_for_each_entry4(tpos, pos, head, member)			 \
+	for (pos = (head)->first;					 \
+	     pos &&							 \
+		({ tpos = hlist_entry(pos, typeof(*tpos), member); 1;}); \
+	     pos = pos->next)
 /**
  * list_for_each_entry	-	iterate over list of given type
  * @pos:	the type * to use as a loop cursor.
