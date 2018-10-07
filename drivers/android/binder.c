@@ -398,6 +398,9 @@ binder_defer_work(struct binder_proc *proc, enum binder_deferred_state defer);
 
 int task_get_unused_fd_flags(struct binder_proc *proc, int flags)
 {
+#ifdef CONFIG_ANDROID_BINDER_IPC_32BIT
+	CRASH HERE MADAFAKA
+#endif
 	struct files_struct *files = proc->files;
 	unsigned long rlim_cur;
 	unsigned long irqs;
